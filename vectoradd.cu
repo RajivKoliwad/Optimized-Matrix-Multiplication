@@ -1,15 +1,22 @@
+// Build: nvcc -O3 -std=c++17 tiled-mat-mul.cu -o tmm -lcublas
+// Run:   ./tmm
+
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
 #include <random>
+#include <vector>
 #include <cassert>
 #include <cmath>
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <string>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include <chrono>    // CPU timing
+#include <chrono>
 
 // -------------------------
-// CUDA error-checking macro
+// CUDA / cuBLAS error macros
 // -------------------------
 #define CUDA_CHECK(stmt)                                                     \
 do {                                                                         \
@@ -21,12 +28,14 @@ do {                                                                         \
     }                                                                        \
 } while (0)
 
-#define CUBLAS_CHECK(stmt) do {                            \
-    cublasStatus_t stat = (stmt);                          \
-    if (stat != CUBLAS_STATUS_SUCCESS) {                   \
-        fprintf(stderr, "%s failed\n", #stmt);             \
-        std::exit(EXIT_FAILURE);                           \
-    }                                                      \
+#define CUBLAS_CHECK(stmt)                                                   \
+do {                                                                         \
+    cublasStatus_t stat = (stmt);                                            \
+    if (stat != CUBLAS_STATUS_SUCCESS) {                                     \
+        fprintf(stderr, "cuBLAS ERROR %s (%d) at %s:%d\n",                   \
+                #stmt, int(stat), __FILE__, __LINE__);                       \
+        std::exit(EXIT_FAILURE);                                             \
+    }                                                                        \
 } while (0)
 
 // -------------------------
@@ -42,17 +51,162 @@ do {                                                                         \
   #define ANSI_RESET "\x1b[0m"
 #endif
 
-// -----------------------------------------
-// cuBLAS Implementation
-// -----------------------------------------
-float cublasVecAdd(const float* __restrict__ dA,
-                   float* __restrict__ dB,
-                   float* __restrict__ hOut,
-                   int N,
-                   float alpha)
-{
-    assert(N > 0);
-    const size_t numBytes = static_cast<size_t>(N) * sizeof(float);
+// ################### DO NOT CHANGE ANYTHING ABOVE ###################
+
+// ------------------------------------------------------------------
+// CPU reference: C[MxN] = A[MxK] * B[KxN]   (row-major)
+// ------------------------------------------------------------------
+static void cpu_sgemm(float *a, float *b, float *c, const unsigned int M, const unsigned int N, const unsigned int K) {
+    for (int m = 0; m < (int)M; m++) {
+        for (int n = 0; n < (int)N; n++) {
+            float psum = 0.0f;
+            for (int i = 0; i < (int)K; i++) {
+                psum += a[m * K + i] * b[i * N + n];
+            }
+            c[m * N + n] = psum;
+        }
+    }
+}
+
+// -------------------------
+// Helper to init input data
+// -------------------------
+static void init_random(float* v, long long n, unsigned long long seed = 42ULL) {
+    std::mt19937_64 gen(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (long long i = 0; i < n; i++) v[i] = dist(gen);
+}
+
+static int verify_equal(const float* ref, const float* got, int count, float delta) {
+    for (int i = 0; i < count; i++) {
+        if (std::abs(ref[i] - got[i]) > delta) {
+            fprintf(stderr, "Mismatch at %d: CPU=%g, GPU=%g\n", i, ref[i], got[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------
+// Simple naive GEMM: one C element per thread (row-major)
+// ------------------------------------------------------------------
+__global__ void simple_gemm(const float* __restrict__ A,
+                            const float* __restrict__ B,
+                            float* C,
+                            const unsigned int M, const unsigned int N, const unsigned int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= (int)M || col >= (int)N) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < (int)K; ++i) {
+        sum += A[row * K + i] * B[i * N + col];
+    }
+    C[row * N + col] = sum;
+}
+
+// ------------------------------------------------------------------
+// Tiled shared-memory GEMM (row-major)
+// ------------------------------------------------------------------
+#define TILE 32
+//tile_width?
+__global__ void tiled_gemm_sm(const float* __restrict__ A,
+                              const float* __restrict__ B,
+                              float* C,
+                              const unsigned int M, const unsigned int N, const unsigned int K) {
+
+	__shared__ float A_Shared[TILE][TILE];
+	__shared__ float B_Shared[TILE][TILE];
+
+	int blockX = blockIdx.x;
+	int blockY = blockIdx.y;
+	int tIdx = threadIdx.x;
+	int tIdy = threadIdx.y;
+// now block location anf thread location are managed
+
+	int Row = blockY * blockDim.y + tIdy;
+	int Column = blockX * blockDim.x + tIdx;
+
+//same read-in location calculation from Matrix Addition
+
+	float MatMulSum = 0.0;
+
+	for (int p = 0; p < (K + TILE - 1)/ TILE; ++p){
+        //loading data
+	    //bounds checking
+        if (Row < M && (p*TILE+tIdx) < K){
+            A_Shared[tIdy][tIdx] = A[Row*K +p * TILE + tIdx];
+        }
+        else{
+            A_Shared[tIdy][tIdx] = 0.0f;
+        }
+
+        if (Column < N && (p*TILE+tIdy) < K){
+            B_Shared[tIdy][tIdx] = B[(p*TILE+tIdy)* N+Column];
+        }
+        else{
+            B_Shared[tIdy][tIdx] = 0.0f;
+        }
+        __syncthreads();
+		for (int k = 0; k < TILE; ++k){
+		MatMulSum += A_Shared[tIdy][k] * B_Shared[k][tIdx];
+	}
+	__syncthreads();
+	}
+
+	if(Row < M&& Column< N) {
+    C[Row * N + Column] = MatMulSum;
+    }
+       	// TODO: Implement tiled shared-memory matrix multiplication
+}
+
+// ------------------------------------------------------------------
+// cuBLAS SGEMM (row-major) via transpose trick
+// ------------------------------------------------------------------
+static inline void cublas_sgemm_rowmajor(cublasHandle_t handle,
+                                         const float* dA, const float* dB, float* dC,
+                                         int M, int N, int K,
+                                         float alpha, float beta) {
+    CUBLAS_CHECK(cublasSgemm(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/dB, /*lda=*/N,
+        /*B=*/dA, /*ldb=*/K,
+        &beta,
+        /*C=*/dC, /*ldc=*/N));
+}
+
+// ##################################################################
+
+int main() {
+    const int TESTNUM = 6;
+    const int VERSIONS = 4; // CPU_ms, simple_gpu_ms, tiled_gpu_ms, cublas_ms
+    const int repeat = 10;
+
+    const unsigned int M_list[10] = {
+      512, 129, 191, 255, 383, 511, 769,
+      1025, 1537, 2049
+    };
+
+    const unsigned int N_list[10] = {
+      512, 131, 193, 257, 385, 513, 771,
+      1027, 1539, 2051
+    };
+
+    const unsigned int K_list[10] = {
+      512, 1001, 1023, 1025, 1151, 1277,
+      1537, 1799, 2049, 2305
+    };
+
+    double times_ms[TESTNUM][VERSIONS];
+    std::vector<std::string> names;
+
+    const int tile_dim = TILE; // fixed
+
+    int rights = 0;
 
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
@@ -61,285 +215,132 @@ float cublasVecAdd(const float* __restrict__ dA,
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    CUDA_CHECK(cudaEventRecord(start));
-    // In-place: dB = alpha*dA + dB
-    CUBLAS_CHECK(cublasSaxpy(handle, N, &alpha, dA, 1, dB, 1));
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+    for (int i = 0; i < TESTNUM; i++) {
+        const unsigned int M = M_list[i];
+        const unsigned int N = N_list[i];
+        const unsigned int K = K_list[i];
 
-    float elapsedMs = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&elapsedMs, start, stop));
+        std::string name = std::to_string(M) + "-" + std::to_string(K) + "-" + std::to_string(N);
+        names.push_back(name);
 
-    CUDA_CHECK(cudaMemcpy(hOut, dB, numBytes, cudaMemcpyDeviceToHost));
+        // Host
+        float *hA = new float[M * K];
+        float *hB = new float[K * N];
+        float *hC_ref = new float[M * N];
+        float *hC_simple = new float[M * N];
+        float *hC_tiled  = new float[M * N];
+        float *hC_cublas = new float[M * N];
 
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+        init_random(hA, (long long)M * (long long)K, 1234ULL);
+        init_random(hB, (long long)K * (long long)N, 5678ULL);
+
+        // Device
+        float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+        cudaMalloc((void **) &dB, K * N * sizeof(float));
+        cudaMalloc((void **) &dA, M * K *sizeof(float));
+        cudaMalloc((void **) &dC, M * N * sizeof(float));
+        // TODO: Allocate device memory for dA, dB, dC
+        // ...
+        // TODO: Copy hA, hB to device memory
+        // ...
+       cudaMemcpy(dB, hB,  K * N * sizeof(float), cudaMemcpyHostToDevice);
+       cudaMemcpy(dA, hA, M * K * sizeof(float), cudaMemcpyHostToDevice);
+
+        // CPU reference
+        auto cpu_start = std::chrono::steady_clock::now();
+        cpu_sgemm(hA, hB, hC_ref, M, N, K);
+        auto cpu_end = std::chrono::steady_clock::now();
+        double cpu_ms = std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count();
+
+        // TODO: Configure grid and block dimensions, use dim3 for block and grid
+        // dim3 block(...);
+        // dim3 grid(...); // Hint: you will need block.x and block.y
+        dim3 block(TILE, TILE);
+        dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+
+        // Simple kernel
+        CUDA_CHECK(cudaMemset(dC, 0, M * N * sizeof(float)));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int run = 0; run < repeat; run++) {
+            simple_gemm<<<grid, block>>>(dA, dB, dC, M, N, K);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float simple_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&simple_ms, start, stop));
+        simple_ms /= repeat;
+        // TODO: Copy dC to hC_simple
+        // ...
+        cudaMemcpy(hC_simple, dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Tiled shared-memory kernel
+        CUDA_CHECK(cudaMemset(dC, 0, M * N * sizeof(float)));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int run = 0; run < repeat; run++) {
+            tiled_gemm_sm<<<grid, block>>>(dA, dB, dC, M, N, K);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float tiled_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&tiled_ms, start, stop));
+        tiled_ms /= repeat;
+        // TODO: Copy dC to hC_tiled
+        cudaMemcpy(hC_tiled, dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // ...
+
+        // cuBLAS
+        cublas_sgemm_rowmajor(handle, dA, dB, dC, M, N, K, 1.0f, 0.0f); // warmup
+        CUDA_CHECK(cudaMemset(dC, 0, M * N * sizeof(float)));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int run = 0; run < repeat; run++) {
+            cublas_sgemm_rowmajor(handle, dA, dB, dC, M, N, K, 1.0f, 0.0f);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float cublas_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&cublas_ms, start, stop));
+        cublas_ms /= repeat;
+        CUDA_CHECK(cudaMemcpy(hC_cublas, dC, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // Verify
+        int err_simple = verify_equal(hC_ref, hC_simple, (int)(M * N), 1e-3f);
+        int err_tiled  = verify_equal(hC_ref, hC_tiled,  (int)(M * N), 1e-3f);
+        int err_cublas = verify_equal(hC_ref, hC_cublas, (int)(M * N), 1e-3f);
+        printf("[%s]: simple=%s, tiled=%s, cuBLAS=%s\n", name.c_str(),
+               err_simple == 0 ? ANSI_GREEN "PASS" ANSI_RESET : ANSI_RED "FAIL" ANSI_RESET,
+               err_tiled  == 0 ? ANSI_GREEN "PASS" ANSI_RESET : ANSI_RED "FAIL" ANSI_RESET,
+               err_cublas == 0 ? ANSI_GREEN "PASS" ANSI_RESET : ANSI_RED "FAIL" ANSI_RESET);
+        if (err_simple == 0 && err_tiled == 0 && err_cublas == 0) rights++;
+
+        // Store times
+        times_ms[i][0] = cpu_ms;
+        times_ms[i][1] = simple_ms;
+        times_ms[i][2] = tiled_ms;
+        times_ms[i][3] = cublas_ms;
+
+
+        // TODO: Free device memory for dA, dB, dC
+        cudaFree(dA);
+        cudaFree(dB);
+        cudaFree(dC);
+        // ...
+        delete[] hA; delete[] hB; delete[] hC_ref; delete[] hC_simple; delete[] hC_tiled; delete[] hC_cublas;
+    }
+
+    printf("[%d/%d] %s\n", rights, TESTNUM, rights==TESTNUM?ANSI_GREEN "PASS" ANSI_RESET:ANSI_RED "FAIL" ANSI_RESET);
+    printf("    %-16s %12s %14s %14s %12s\n",
+       "M-K-N", "cpu_ms", "simple_gpu_ms", "tiled_gpu_ms", "cublas_ms");
+    for (int i = 0; i < TESTNUM; ++i) {
+        printf("    %-16s %12.3f %14.3f %14.3f %12.3f\n",
+            names[i].c_str(),
+            times_ms[i][0], times_ms[i][1], times_ms[i][2], times_ms[i][3]);
+    }
+
     CUBLAS_CHECK(cublasDestroy(handle));
-    return elapsedMs;
-}
-
-// -------------------------
-// CPU reference (for check)
-// -------------------------
-void vecAddHost(const std::vector<float>& A,
-                const std::vector<float>& B,
-                std::vector<float>& C,
-                double alpha)
-{
-    int N = int(A.size());
-    for (int i = 0; i < N; ++i) {
-        C[i] = alpha*A[i] + B[i];
-    }
-}
-
-// -------------------------
-// Helper to init input data
-// -------------------------
-void initRandom(std::vector<float>& v, uint64_t seed = 42)
-{
-    std::mt19937_64 gen(seed);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (auto& x : v) x = dist(gen);
-}
-
-
-// ------------------------------------------------------------------
-// Simple Kernel: C[i] = alpha*A[i] + B[i]
-// ------------------------------------------------------------------
-__global__ void simpleVecAdd(const float* __restrict__ A,
-                             const float* __restrict__ B,
-                             float* __restrict__ C,
-                             int N,
-                             float alpha)
-{
-
-    int i = blockDim.x*blockIdx.x + threadIdx.x;
-    if(i < N){
-        C[i] = (alpha * A[i]) + B[i];
-    }
-
-}
-
-// ------------------------------------------------------------------
-// Optimized Kernel with Grid-stride Loop 
-// ------------------------------------------------------------------
-__global__ void optimizedVecAdd(const float* __restrict__ A, 
-                                const float* __restrict__ B, 
-                                float* __restrict__ C, 
-                                int N,
-                                float alpha)
-{
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    int stride = (gridDim.x *blockDim.x);
-       for(; i <N; i+= stride){
-        C[i] =( alpha * A[i])+ B[i];
-       }
-}
-
-// ------------------------------------------------------------------
-// Optimized Kernel with Grid-stride Loop and Loop Unrolling
-// ------------------------------------------------------------------
-__global__ void optimizedVecAdd_lu(const float* __restrict__ A, 
-                                const float* __restrict__ B, 
-                                float* __restrict__ C, 
-                                int N,
-                                float alpha)
-{
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    int stride = (gridDim.x *blockDim.x);
-       for(; i <N; i+=( stride) ){
-        C[i] = (alpha * A[i]) + B[i];
-        C[i + 1 ] =( alpha * A[i + 1]) + B[i + 1];
-        }
-}
-
-// ##################################################################
-
-int main(int argc, char** argv)
-{
-    // ------------------------------------------------------------------
-    // Problem size
-    // ------------------------------------------------------------------
-    int N = (argc > 1) ? std::atoi(argv[1]) : (1 << 20);
-    if (N <= 0) {
-        fprintf(stderr, "N must be positive\n");
-        return EXIT_FAILURE;
-    }
-    float alpha = 2.5f;
-
-    int threadsPerBlock = (argc > 2) ? std::atoi(argv[2]) : 256;
-    if (threadsPerBlock <= 0) threadsPerBlock = 256;
-
-    size_t numBytes = size_t(N) * sizeof(float);
-    printf("Vector length = %d (%.2f MB per vector), TPB=%d\n",
-           N, numBytes / (1024.0 * 1024.0), threadsPerBlock);
-    
-    // ------------------------------------------------------------------
-    // Allocate & initialize host
-    // ------------------------------------------------------------------
-    std::vector<float> hA(N), hB(N);
-    std::vector<float> hC_simple(N), hC_opt(N),
-                       hC_cublas(N), hRef(N),
-                       hC_opt_lu(N);
-
-    initRandom(hA, 1234);
-    initRandom(hB, 5678);
-
-    // ------------------------------------------------------------------
-    // Allocate device memory
-    // ------------------------------------------------------------------
-    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
-    // TODO: cudaMalloc dA, dB, dC
-        cudaMalloc((void**)&dA, numBytes);
-        cudaMalloc((void**)&dB, numBytes);
-        cudaMalloc((void**)&dC, numBytes);
-
-    cudaMemcpy(dA, hA.data(), N*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, hB.data(), N*sizeof(float), cudaMemcpyHostToDevice);
-    // ------------------------------------------------------------------
-    // Kernel config
-    // ------------------------------------------------------------------
-int numBlocks = ( N + threadsPerBlock -1)/threadsPerBlock;
-    printf("Launching %d blocks of %d threads\n", numBlocks, threadsPerBlock);
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    // ------------------------------------------------------------------
-    // simpleVecAdd
-    // ------------------------------------------------------------------
-    CUDA_CHECK(cudaMemset(dC, 0, numBytes));
-    CUDA_CHECK(cudaEventRecord(start));
-    simpleVecAdd<<<numBlocks, threadsPerBlock>>>(dA, dB, dC, N, alpha);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float timeSimpleMs = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&timeSimpleMs, start, stop));
-    optimizedVecAdd_lu<<< 32 , threadsPerBlock>>>(dA, dB, dC, N, alpha);
-
-    cudaMemcpy(hC_simple.data() , dC, N*sizeof(float), cudaMemcpyDeviceToHost);
-    printf("p1 done\n");
-    // ------------------------------------------------------------------
-    // optimizedVecAdd
-    // ------------------------------------------------------------------
-    CUDA_CHECK(cudaMemset(dC, 0, numBytes));
-    CUDA_CHECK(cudaEventRecord(start));
-    optimizedVecAdd<<< 32 , threadsPerBlock>>>(dA, dB, dC, N, alpha);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float timeOptimizedMs = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&timeOptimizedMs, start, stop));
-    cudaMemcpy(hC_opt.data(), dC, N*sizeof(float), cudaMemcpyDeviceToHost);
-    // ------------------------------------------------------------------
-    // optimizedVecAdd_lu
-    // ------------------------------------------------------------------
-    CUDA_CHECK(cudaMemset(dC, 0, numBytes));
-    CUDA_CHECK(cudaEventRecord(start));
-
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float timeOptimizedLuMs = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&timeOptimizedLuMs, start, stop));
-
-    cudaMemcpy(hC_opt_lu.data(), dC, N*sizeof(float), cudaMemcpyDeviceToHost);
-    // ------------------------------------------------------------------
-    // cuBLAS
-    // ------------------------------------------------------------------
-    double timeCublasMs = cublasVecAdd(dA, dB, hC_cublas.data(), N, alpha);
-    
-    // ------------------------------------------------------------------
-    // Verify against CPU result
-    // ------------------------------------------------------------------
-    auto cpuStart = std::chrono::steady_clock::now();
-    vecAddHost(hA, hB, hRef, alpha);
-    auto cpuEnd = std::chrono::steady_clock::now();
-    double timeCpuMs = std::chrono::duration<double, std::milli>(cpuEnd - cpuStart).count();
-
-    printf("Simple kernel verification: ");
-    int errors = 0;
-    for (int i = 0; i < N; ++i) {
-        float diff = std::abs(hRef[i] - hC_simple[i]);
-        if (diff > 1e-5f) {
-            if (errors == 0) {
-                fprintf(stderr, "First mismatch %d at %d: GPU %f vs CPU %f\n",
-                        errors+1, i, hC_simple[i], hRef[i]);
-            }
-            errors++;
-        }
-    }
-
-    if (errors == 0) {
-        printf(ANSI_GREEN "Result: PASS!" ANSI_RESET "\n");
-    } else {
-        printf(ANSI_RED   "Result: FAIL! (mismatches: %d)" ANSI_RESET "\n", errors);
-    }
-
-    printf("Strided kernel verification: ");
-    errors = 0;
-    for (int i = 0; i < N; ++i) {
-        float diff = std::abs(hRef[i] - hC_opt[i]);
-        if (diff > 1e-5f) {
-            if (errors == 0) {
-                fprintf(stderr, "First mismatch %d at %d: GPU %f vs CPU %f\n",
-                        errors+1, i, hC_opt[i], hRef[i]);
-            }
-            errors++;
-        }
-    }
-
-    if (errors == 0) {
-        printf(ANSI_GREEN "Result: PASS!" ANSI_RESET "\n");
-    } else {
-        printf(ANSI_RED   "Result: FAIL! (mismatches: %d)" ANSI_RESET "\n", errors);
-    }
-
-    printf("Strided kernel with loop unrolling verification: ");
-    errors = 0;
-    for (int i = 0; i < N; ++i) {
-        float diff = std::abs(hRef[i] - hC_opt_lu[i]);
-        if (diff > 1e-5f) {
-            if (errors == 0) {
-                fprintf(stderr, "First mismatch %d at %d: GPU %f vs CPU %f\n",
-                        errors+1, i, hC_opt_lu[i], hRef[i]);
-            }
-            errors++;
-        }
-    }
-
-    if (errors == 0) {
-        printf(ANSI_GREEN "Result: PASS!" ANSI_RESET "\n");
-    } else {
-        printf(ANSI_RED   "Result: FAIL! (mismatches: %d)" ANSI_RESET "\n", errors);
-    }
-
-    // ------------------------------------------------------------------
-    // Timing summary
-    // ------------------------------------------------------------------
-    // Fixed-width header
-    printf("%-10s %-8s %-15s %-15s %-20s %-12s %-12s\n",
-        "N", "TPB", "Simple_ms", "Strided_ms", "StridedUnroll_ms", "cuBLAS_ms", "CPU_ms");
-
-    // Fixed-width row
-    printf("%-10d %-8d %-15.3f %-15.3f %-20.3f %-12.3f %-12.3f\n",
-        N, threadsPerBlock,
-        timeSimpleMs,
-        timeOptimizedMs,
-        timeOptimizedLuMs,
-        timeCublasMs,
-        timeCpuMs);
-
-    // ------------------------------------------------------------------
-    // Cleanup
-    // ------------------------------------------------------------------
-    cudaFree(dB);
-    cudaFree(dC);
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    return (errors == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return EXIT_SUCCESS;
 }
