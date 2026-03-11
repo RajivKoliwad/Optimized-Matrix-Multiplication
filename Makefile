@@ -1,14 +1,13 @@
-# Makefile — build vectoradd
+# Makefile — build
 NVCC ?= nvcc
 ARCH ?= native
 CXXSTD ?= c++17
 OPTFLAGS ?= -O2
 LIBS      := -lcublas
 
-all: vectoradd
+all: tmm
 
-vectoradd: vectoradd.cu
+tmm: tiled-mat-mul.cu
 	$(NVCC) $(OPTFLAGS) -std=$(CXXSTD) -arch=$(ARCH) -o $@ $< $(LIBS)
-
 clean:
-	rm -f vectoradd
+	rm -f tmm
